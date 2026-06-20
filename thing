@@ -1,0 +1,766 @@
+-- =====================================================================
+-- CHARLIE THE BOT: MASTER CORE v15 (STABILIZED STEP & ADVANCED INTERACT)
+-- =====================================================================
+local RENDER_URL = "https://charlie-ai-core-23af.onrender.com/game_chat"
+local MASTER_USER_ID = 10962793053
+
+local Players            = game:GetService("Players")
+local RunService         = game:GetService("RunService")
+local TextChatService    = game:GetService("TextChatService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local HttpService        = game:GetService("HttpService")
+local PathfindingService = game:GetService("PathfindingService")
+local VirtualUser        = game:GetService("VirtualUser")
+
+local LocalPlayer = Players.LocalPlayer
+local Character   = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local Humanoid    = Character:WaitForChild("Humanoid")
+local RootPart    = Character:WaitForChild("HumanoidRootPart")
+
+local httpRequest = (syn and syn.request) or (http and http.request) or request or http_request or (HttpService and HttpService.PostAsync)
+
+-- =====================================================================
+-- CONFIGURATION & STATE ENGINES
+-- =====================================================================
+local PathfindingEnabled  = false  
+local AutoJumpEnabled     = false     
+local FightOrFlightActive = false 
+local AiGenerationEnabled = true
+local GlobalChatActive    = false
+
+-- Target Lock States
+local DirectAttackTarget  = nil
+local AlwaysEquipEnabled  = false
+local AlwaysEquipToolName = ""
+
+-- Safety & Rampage Toggles
+local OwnerFireAllowed    = false 
+local RandomAttackActive  = false 
+local RandomCurrentTarget = nil   
+
+local TIMEOUT        = 20     
+local JUMP_AFTER     = 2.5      
+local WP_TIMEOUT     = 4.5      
+local IsCurrentlyWalking = false 
+
+local PATH_PARAMS = {
+    AgentRadius   = 2,
+    AgentHeight   = 5,
+    AgentCanJump  = true,
+    AgentMaxSlope = 45,
+    WaypointSpacing = 3, -- Closer waypoint layout to stop shaky paths
+}
+
+local TargetPlayer = nil
+local IsFollowing  = false
+local IsWandering  = false
+
+local ResetAwaitingConfirmation = false
+local ResetAdminUser            = nil
+
+local RecentAttackers      = {}
+local DamageLogConnection  = nil
+local CombatThreadActive   = false
+local FlightPanicUntil     = 0     
+
+local Admins = {
+    [tostring(MASTER_USER_ID)] = true,
+    [LocalPlayer.Name:lower()] = true
+}
+
+local WeaponKeywords = {"pistol", "rifle", "sword", "knife", "gun", "blade", "weapon", "bat", "glock", "dagger", "axe", "katana"}
+
+-- =====================================================================
+-- SYSTEM EMULATORS & CONTROLS
+-- =====================================================================
+local function speakInGame(text)
+    if not text or text == "" then return end
+    task.spawn(function()
+        pcall(function()
+            local textChannels = TextChatService:FindFirstChild("TextChannels")
+            local channel = textChannels and textChannels:FindFirstChild("RBXGeneral") or TextChatService.ChatInputBarConfiguration.TargetTextChannel
+            if channel then channel:SendAsync(text) end
+        end)
+    end)
+    pcall(function()
+        local sayMessageRequest = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents") and ReplicatedStorage.DefaultChatSystemChatEvents:FindFirstChild("SayMessageRequest")
+        if sayMessageRequest then sayMessageRequest:FireServer(text, "All") end
+    end)
+end
+
+local function equipToolByName(nameStr)
+    if not nameStr or nameStr == "" or not Humanoid then return false end
+    for _, tool in ipairs(LocalPlayer.Backpack:GetChildren()) do
+        if tool:IsA("Tool") and (tool.Name:lower() == nameStr:lower() or string.find(tool.Name:lower(), nameStr:lower())) then
+            Humanoid:EquipTool(tool)
+            return true
+        end
+    end
+    return false
+end
+
+local function scanAndEquipBestWeapon()
+    if not Character or not Humanoid then return false end
+    
+    if AlwaysEquipEnabled and AlwaysEquipToolName ~= "" then
+        local foundInHand = Character:FindFirstChild(AlwaysEquipToolName)
+        if foundInHand then return true end
+        local success = equipToolByName(AlwaysEquipToolName)
+        if success then return true end
+    end
+    
+    local bestWeapon = nil
+    local function checkContainer(container)
+        for _, tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") then
+                local toolName = tool.Name:lower()
+                for _, keyword in ipairs(WeaponKeywords) do
+                    if string.find(toolName, keyword) then bestWeapon = tool; break end
+                end
+            end
+        end
+    end
+
+    checkContainer(LocalPlayer.Backpack)
+    if not bestWeapon then checkContainer(Character) end
+
+    if bestWeapon and bestWeapon.Parent == LocalPlayer.Backpack then
+        Humanoid:EquipTool(bestWeapon)
+        return true
+    elseif bestWeapon then
+        return true
+    end
+    return false
+end
+
+-- =====================================================================
+-- SPRINT SPEED SYNC MODULE
+-- =====================================================================
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        pcall(function()
+            local masterPlayer = Players:GetPlayerByUserId(MASTER_USER_ID)
+            if masterPlayer and masterPlayer.Character and masterPlayer.Character:FindFirstChild("Humanoid") then
+                local masterSpeed = masterPlayer.Character.Humanoid.WalkSpeed
+                if Humanoid and Humanoid.WalkSpeed ~= masterSpeed then
+                    Humanoid.WalkSpeed = masterSpeed
+                end
+            end
+        end)
+    end
+end)
+
+-- =====================================================================
+-- PRODUCTION STABILIZED PATH MOTOR (ANTI-STUTTER ENGINE)
+-- =====================================================================
+local function walkTo(goalPos, arriveRadius)
+    if not Humanoid or not RootPart or Humanoid.Health <= 0 then return "died" end
+    if IsCurrentlyWalking then return "busy" end 
+    IsCurrentlyWalking = true
+
+    local globalStart = os.clock()
+
+    if not PathfindingEnabled then
+        Humanoid:MoveTo(goalPos)
+        local finished = false
+        local finishedConn = Humanoid.MoveToFinished:Connect(function() finished = true end)
+        while not finished do
+            task.wait(0.05)
+            if not RootPart.Parent or Humanoid.Health <= 0 then finishedConn:Disconnect(); IsCurrentlyWalking = false; return "died" end
+            if os.clock() - globalStart > TIMEOUT then finishedConn:Disconnect(); IsCurrentlyWalking = false; return "timeout" end
+            if (RootPart.Position - goalPos).Magnitude <= arriveRadius then break end
+        end
+        finishedConn:Disconnect()
+        IsCurrentlyWalking = false
+        return "arrived"
+    end
+
+    local path = PathfindingService:CreatePath(PATH_PARAMS)
+    local ok   = pcall(function() path:ComputeAsync(RootPart.Position, goalPos) end)
+
+    if not ok or path.Status ~= Enum.PathStatus.Success then
+        Humanoid:MoveTo(goalPos)
+        IsCurrentlyWalking = false
+        return "arrived"
+    end
+
+    local waypoints = path:GetWaypoints()
+
+    for i = 2, #waypoints do
+        if not RootPart.Parent or Humanoid.Health <= 0 then IsCurrentlyWalking = false; return "died" end
+        if (RootPart.Position - goalPos).Magnitude <= arriveRadius then break end
+        if os.clock() - globalStart > TIMEOUT then Humanoid:MoveTo(RootPart.Position); IsCurrentlyWalking = false; return "timeout" end
+
+        local wp = waypoints[i]
+        if wp.Action == Enum.PathWaypointAction.Jump or AutoJumpEnabled then
+            Humanoid.Jump = true
+        end
+
+        Humanoid:MoveTo(wp.Position)
+
+        local wpDone     = false
+        local wpStart    = os.clock()
+        local jumpedAt   = -999
+        local lastPos    = RootPart.Position
+        local lastMoveAt = os.clock()
+
+        local conn = Humanoid.MoveToFinished:Connect(function() wpDone = true end)
+
+        while not wpDone do
+            -- Adaptive yielding: checks quick steps when close to keep momentum high
+            local distToWp = (RootPart.Position - wp.Position).Magnitude
+            if distToWp <= 2.5 then wpDone = true break end
+            
+            task.wait(0.02)
+            if not RootPart.Parent or Humanoid.Health <= 0 then conn:Disconnect(); IsCurrentlyWalking = false; return "died" end
+            if os.clock() - globalStart > TIMEOUT then conn:Disconnect(); Humanoid:MoveTo(RootPart.Position); IsCurrentlyWalking = false; return "timeout" end
+            if (RootPart.Position - goalPos).Magnitude <= arriveRadius then conn:Disconnect(); wpDone = true; break end
+
+            local moved = (RootPart.Position - lastPos).Magnitude
+            lastPos = RootPart.Position
+            if moved > 0.05 then lastMoveAt = os.clock() end
+
+            if (os.clock() - lastMoveAt) >= JUMP_AFTER and (os.clock() - jumpedAt) > JUMP_AFTER then
+                Humanoid.Jump = true
+                jumpedAt = os.clock()
+                task.wait(0.05)
+                Humanoid:MoveTo(wp.Position)
+            end
+
+            if os.clock() - wpStart > WP_TIMEOUT then
+                conn:Disconnect()
+                IsCurrentlyWalking = false
+                return walkTo(goalPos, arriveRadius) 
+            end
+        end
+        conn:Disconnect()
+    end
+    IsCurrentlyWalking = false
+    return "arrived"
+end
+
+-- =====================================================================
+-- TIMED CHRONO RUNNERS (BACKGROUND TOOL HOLDS)
+-- =====================================================================
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if AlwaysEquipEnabled and AlwaysEquipToolName ~= "" and Humanoid and Humanoid.Health > 0 then
+            local currentTool = Character:FindFirstChildOfClass("Tool")
+            if not currentTool or currentTool.Name:lower() ~= AlwaysEquipToolName:lower() then
+                equipToolByName(AlwaysEquipToolName)
+            end
+        end
+    end
+end)
+
+-- =====================================================================
+-- CORE MOVEMENT THREAD ROUTERS
+-- =====================================================================
+local function stopAllMovement()
+    IsFollowing = false
+    IsWandering = false
+    DirectAttackTarget = nil
+    RandomCurrentTarget = nil
+    TargetPlayer = nil
+    if Humanoid then Humanoid:MoveTo(RootPart.Position) end
+end
+
+local function runFollowThread()
+    task.spawn(function()
+        while IsFollowing and TargetPlayer and TargetPlayer.Character and RootPart.Parent do
+            local tRoot = TargetPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if tRoot then
+                local offsetPos = (tRoot.CFrame * CFrame.new(0, 0, -5)).Position
+                if (RootPart.Position - offsetPos).Magnitude > 4 then
+                    walkTo(offsetPos, 4)
+                end
+            end
+            task.wait(0.1)
+        end
+    end)
+end
+
+local function runWanderThread()
+    task.spawn(function()
+        while IsWandering and RootPart.Parent do
+            if not IsCurrentlyWalking then
+                local rx = math.random(-30, 30)
+                local rz = math.random(-30, 30)
+                walkTo(RootPart.Position + Vector3.new(rx, 0, rz), 5)
+            end
+            task.wait(1.2)
+        end
+    end)
+end
+
+-- =====================================================================
+-- ADVANCED PROGRESSIVE PROXIMITY INTERACT HOOK
+-- =====================================================================
+local function executeAdvancedInteract()
+    if not Character or not RootPart then return false end
+    local closestPrompt = nil
+    local shortestDistance = 15 -- Interact range threshold
+
+    for _, desc in ipairs(workspace:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") and desc.Enabled then
+            local parentPart = desc.Parent
+            if parentPart and parentPart:IsA("BasePart") then
+                local dist = (parentPart.Position - RootPart.Position).Magnitude
+                if dist <= desc.MaxActivationDistance and dist < shortestDistance then
+                    shortestDistance = dist
+                    closestPrompt = desc
+                end
+            end
+        end
+    end
+
+    if closestPrompt then
+        task.spawn(function()
+            pcall(function()
+                -- Step 1: Fire Engine Trigger
+                if fireproximityprompt then
+                    fireproximityprompt(closestPrompt)
+                end
+                -- Step 2: Handle extended duration hold parameters directly on execution pipeline
+                if closestPrompt.HoldDuration > 0 then
+                    local startTime = os.clock()
+                    while os.clock() - startTime < (closestPrompt.HoldDuration + 0.1) do
+                        if fireproximityprompt then fireproximityprompt(closestPrompt) end
+                        task.wait(0.05)
+                    end
+                end
+            end)
+        end)
+        return true, closestPrompt.Parent.Name
+    end
+    return false, nil
+end
+
+-- =====================================================================
+-- COMBAT CORE ENGINE (FIGHT, FLIGHT, ASSASSINATION, & RAMPAGE MODES)
+-- =====================================================================
+local function setupThreatTracking()
+    if DamageLogConnection then DamageLogConnection:Disconnect() end
+    DamageLogConnection = Humanoid.HealthChanged:Connect(function(currentHealth)
+        if currentHealth <= 0 then 
+            RecentAttackers = {}
+            FlightPanicUntil = 0
+            DirectAttackTarget = nil 
+            RandomAttackActive = false 
+            RandomCurrentTarget = nil
+            return 
+        end
+        
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                local isMaster = (p.UserId == MASTER_USER_ID) or (p.Name:lower() == "infinitemndev")
+                if not isMaster or OwnerFireAllowed then
+                    local dist = (p.Character.HumanoidRootPart.Position - RootPart.Position).Magnitude
+                    if dist <= 22 then
+                        RecentAttackers[p.Name] = {player = p, timeStamp = os.clock()}
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function runCombatCoreBrain()
+    if CombatThreadActive then return end
+    CombatThreadActive = true
+
+    task.spawn(function()
+        while (FightOrFlightActive or DirectAttackTarget ~= nil or RandomAttackActive) and Humanoid and RootPart and RootPart.Parent do
+            task.wait(0.02)
+            
+            local targetEnemy = nil
+            local closestDist = 9999
+            local isAssassinationMode = false
+            
+            if DirectAttackTarget and DirectAttackTarget.Character and DirectAttackTarget.Character:FindFirstChild("Humanoid") and DirectAttackTarget.Character.Humanoid.Health > 0 then
+                local isMaster = (DirectAttackTarget.UserId == MASTER_USER_ID) or (DirectAttackTarget.Name:lower() == "infinitemndev")
+                if not isMaster or OwnerFireAllowed then
+                    local eRoot = DirectAttackTarget.Character:FindFirstChild("HumanoidRootPart")
+                    if eRoot then
+                        targetEnemy = DirectAttackTarget.Character
+                        closestDist = (eRoot.Position - RootPart.Position).Magnitude
+                        isAssassinationMode = true
+                    end
+                end
+            end
+            
+            if not targetEnemy and RandomAttackActive then
+                if RandomCurrentTarget and RandomCurrentTarget.Character and RandomCurrentTarget.Character:FindFirstChild("Humanoid") and RandomCurrentTarget.Character.Humanoid.Health > 0 then
+                    local eRoot = RandomCurrentTarget.Character:FindFirstChild("HumanoidRootPart")
+                    if eRoot then
+                        targetEnemy = RandomCurrentTarget.Character
+                        closestDist = (eRoot.Position - RootPart.Position).Magnitude
+                    end
+                else
+                    RandomCurrentTarget = nil
+                    local nearestPlayer = nil
+                    local nearestDist = 9999
+                    
+                    for _, p in ipairs(Players:GetPlayers()) do
+                        if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("Humanoid") and p.Character.Humanoid.Health > 0 then
+                            local isMaster = (p.UserId == MASTER_USER_ID) or (p.Name:lower() == "infinitemndev")
+                            if not isMaster or OwnerFireAllowed then
+                                local pRoot = p.Character:FindFirstChild("HumanoidRootPart")
+                                if pRoot then
+                                    local d = (pRoot.Position - RootPart.Position).Magnitude
+                                    if d < nearestDist then
+                                        nearestDist = d
+                                        nearestPlayer = p
+                                    end
+                               end
+                            end
+                        end
+                    end
+                    
+                    if nearestPlayer then
+                        RandomCurrentTarget = nearestPlayer
+                        targetEnemy = nearestPlayer.Character
+                        closestDist = nearestDist
+                        speakInGame("Rampage targeting signature: " .. nearestPlayer.Name)
+                    end
+                end
+            end
+            
+            if not targetEnemy and FightOrFlightActive then
+                for name, data in pairs(RecentAttackers) do
+                    if os.clock() - data.timeStamp > 10 or not data.player.Character or not data.player.Character:FindFirstChild("Humanoid") or data.player.Character.Humanoid.Health <= 0 then
+                        RecentAttackers[name] = nil
+                    else
+                        local eRoot = data.player.Character:FindFirstChild("HumanoidRootPart")
+                        if eRoot then
+                            local d = (eRoot.Position - RootPart.Position).Magnitude
+                            if d < closestDist then closestDist = d; targetEnemy = data.player.Character end
+                        end
+                    end
+                end
+            end
+
+            local healthRatio = Humanoid.Health / Humanoid.MaxHealth
+            
+            if healthRatio <= 0.35 and targetEnemy and not isAssassinationMode and not RandomAttackActive and os.clock() > FlightPanicUntil then
+                FlightPanicUntil = os.clock() + 20
+            end
+
+            if os.clock() < FlightPanicUntil and not isAssassinationMode and not RandomAttackActive then
+                IsFollowing = false; IsWandering = false
+                if targetEnemy and targetEnemy:FindFirstChild("HumanoidRootPart") then
+                    local escapeDirection = (RootPart.Position - targetEnemy.HumanoidRootPart.Position).Unit
+                    walkTo(RootPart.Position + (escapeDirection * 30), 4)
+                end
+            elseif targetEnemy and targetEnemy:FindFirstChild("HumanoidRootPart") then
+                IsFollowing = false; IsWandering = false
+                local enemyRoot = targetEnemy.HumanoidRootPart
+                local targetLook = Vector3.new(enemyRoot.Position.X, RootPart.Position.Y, enemyRoot.Position.Z)
+                RootPart.CFrame = CFrame.lookAt(RootPart.Position, targetLook)
+                
+                scanAndEquipBestWeapon()
+                
+                if closestDist > 3.5 then
+                    Humanoid:MoveTo(enemyRoot.Position)
+                else
+                    if Humanoid then Humanoid:MoveTo(RootPart.Position) end
+                    RootPart.CFrame = CFrame.lookAt(RootPart.Position, targetLook)
+                end
+
+                pcall(function()
+                    VirtualUser:Button1Down(Vector2.new(0, 0))
+                    task.wait(0.01)
+                    VirtualUser:Button1Up(Vector2.new(0, 0))
+                end)
+                
+                local currentTool = Character:FindFirstChildOfClass("Tool")
+                if currentTool then currentTool:Activate() end
+            end
+        end
+        CombatThreadActive = false
+    end)
+end
+
+local function findPlayer(nameStr)
+    if not nameStr or nameStr == "" then return nil end
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name:lower() == nameStr:lower() or p.DisplayName:lower() == nameStr:lower() then return p end
+    end
+    return nil
+end
+
+-- =====================================================================
+-- EXECUTOR INTERCEPTOR AND COMMAND PARSER
+-- =====================================================================
+local function processIncomingPayload(sender, message)
+    local cleanMsg = message:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    local cleanMsgLower = cleanMsg:lower()
+    local senderUserIdStr = tostring(sender.UserId)
+    local senderNameLower = sender.Name:lower()
+    local isAdmin = Admins[senderUserIdStr] or Admins[senderNameLower] or (sender.UserId == MASTER_USER_ID)
+    
+    if ResetAwaitingConfirmation and sender == ResetAdminUser then
+        local validationInput = cleanMsgLower:gsub("%s+", "")
+        if validationInput == "yes" then
+            ResetAwaitingConfirmation = false; ResetAdminUser = nil
+            pcall(function()
+                if httpRequest == HttpService.PostAsync then
+                    HttpService:PostAsync(RENDER_URL, HttpService:JSONEncode({message = "__INTERNAL_WIPE_ALL_MEMORY__"}), Enum.HttpContentType.ApplicationJson)
+                else
+                    httpRequest({
+                        Url = RENDER_URL,
+                        Method = "POST",
+                        Headers = { ["Content-Type"] = "application/json" },
+                        Body = HttpService:JSONEncode({message = "__INTERNAL_WIPE_ALL_MEMORY__"})
+                    })
+                end
+            end)
+            speakInGame("Memory Reset Successfully")
+            return
+        elseif validationInput == "no" then
+            ResetAwaitingConfirmation = false; ResetAdminUser = nil
+            speakInGame("Memory Reset Canceled")
+            return
+        end
+    end
+
+    if string.sub(cleanMsg, 1, 5) == "!pip " then
+        if not isAdmin then return end
+        local fullCmd = string.sub(cleanMsg, 6)
+        local args = string.split(fullCmd, " ")
+        local baseCmd = args[1]:lower()
+        
+        -- !pip interact
+        if baseCmd == "interact" then
+            local engaged, targetName = executeAdvancedInteract()
+            if engaged then
+                speakInGame("Fired proximity channels onto object signature: " .. targetName)
+            else
+                speakInGame("Interact Failure: No valid proximity nodes within physical vector lines.")
+            end
+            return
+            
+        elseif baseCmd == "ownerfirefalse" then
+            OwnerFireAllowed = false
+            speakInGame("Safety protocol active. Creator protection confirmed.")
+            return
+            
+        elseif baseCmd == "ownerfiretrue" then
+            OwnerFireAllowed = true
+            speakInGame("Safety overrides removed. Creator target signature unlocked.")
+            return
+            
+        elseif baseCmd == "randomattack" then
+            stopAllMovement()
+            RandomAttackActive = true
+            speakInGame("Server rampage protocol initiated.")
+            setupThreatTracking()
+            runCombatCoreBrain()
+            return
+            
+        elseif baseCmd == "randomattackstop" then
+            RandomAttackActive = false
+            RandomCurrentTarget = nil
+            speakInGame("Rampage suspended. Standing down.")
+            return
+            
+        elseif baseCmd == "alwaysequip" and args[2] then
+            local tName = string.sub(fullCmd, string.find(fullCmd, " ") + 1)
+            AlwaysEquipEnabled = true
+            AlwaysEquipToolName = tName
+            equipToolByName(tName)
+            speakInGame("Always equipping: " .. tName)
+            return
+            
+        elseif baseCmd == "unalwaysequip" then
+            AlwaysEquipEnabled = false
+            AlwaysEquipToolName = ""
+            speakInGame("Always-equip lock overridden.")
+            return
+            
+        elseif baseCmd == "attack" and args[2] then
+            local targetPlayerObj = findPlayer(args[2])
+            if targetPlayerObj then
+                stopAllMovement()
+                DirectAttackTarget = targetPlayerObj
+                speakInGame("Locked onto " .. targetPlayerObj.Name .. ". Engaging.")
+                setupThreatTracking()
+                runCombatCoreBrain()
+            else
+                speakInGame("Attack Error: Target signature missing.")
+            end
+            return
+            
+        elseif baseCmd == "stopattack" then
+            DirectAttackTarget = nil
+            speakInGame("Assassination parameters dropped.")
+            return
+            
+        elseif baseCmd == "datareset" then
+            ResetAwaitingConfirmation = true
+            ResetAdminUser = sender
+            speakInGame("Are you sure you want to run this command? answer with \"Yes\" or \"No\"")
+            return
+            
+        elseif baseCmd == "equip" and args[2] then
+            local toolNameQuery = string.sub(fullCmd, string.find(fullCmd, " ") + 1)
+            local success = equipToolByName(toolNameQuery)
+            if success then speakInGame("Equipped " .. toolNameQuery) else speakInGame("Tool not found.") end
+            return
+            
+        elseif baseCmd == "blacklist" and args[2] then
+            local targetName = args[2]:lower()
+            if targetName ~= tostring(MASTER_USER_ID) and targetName ~= "infinitemndev" then
+                Admins[targetName] = nil
+                speakInGame(args[2] .. " stripped of admin access.")
+            else
+                speakInGame("Access Denied.")
+            end
+            return
+            
+        elseif baseCmd == "autojumpenable" then
+            AutoJumpEnabled = true
+            speakInGame("Auto-jump navigation: ON.")
+            return
+            
+        elseif baseCmd == "autojumpdisable" then
+            AutoJumpEnabled = false
+            speakInGame("Auto-jump navigation: OFF.")
+            return
+            
+        elseif baseCmd == "fightorflightenable" then
+            FightOrFlightActive = true
+            setupThreatTracking()
+            runCombatCoreBrain()
+            speakInGame("Fight or Flight: ACTIVE.")
+            return
+            
+        elseif baseCmd == "fightorflightdisable" then
+            FightOrFlightActive = false
+            FlightPanicUntil = 0
+            RecentAttackers = {}
+            speakInGame("Fight or Flight: DISABLED.")
+            return
+
+        elseif baseCmd == "follow" then
+            stopAllMovement()
+            IsFollowing = true
+            TargetPlayer = args[2] and findPlayer(args[2]) or Players:GetPlayerByUserId(MASTER_USER_ID)
+            if TargetPlayer then speakInGame("Following " .. TargetPlayer.Name) runFollowThread() end
+            return
+            
+        elseif baseCmd == "freeze" then
+            stopAllMovement()
+            speakInGame("Locomotive systems frozen.")
+            return
+            
+        elseif baseCmd == "wander" then
+            stopAllMovement()
+            IsWandering = true
+            speakInGame("Autonomous exploration active.")
+            runWanderThread()
+            return
+            
+        elseif baseCmd == "pathfindingenable" then
+            PathfindingEnabled = true
+            speakInGame("PathfindingService: ONLINE.")
+            return
+            
+        elseif baseCmd == "pathfindingdisable" then
+            PathfindingEnabled = false
+            speakInGame("PathfindingService: OFFLINE.")
+            return
+            
+        elseif baseCmd == "kill" then
+            if Humanoid then Humanoid.Health = 0 end
+            return
+            
+        elseif baseCmd == "admin" and args[2] then
+            local target = findPlayer(args[2])
+            if target then
+                Admins[tostring(target.UserId)] = true
+                Admins[target.Name:lower()] = true
+                speakInGame(target.Name .. " granted admin permissions.")
+            end
+            return
+            
+        elseif baseCmd == "disable" then
+            AiGenerationEnabled = false; speakInGame("Charlie AI generation: OFFLINE.")
+            return
+            
+        elseif baseCmd == "enable" then
+            AiGenerationEnabled = true; speakInGame("Charlie AI generation: ONLINE.")
+            return
+            
+        -- !pip help
+        elseif baseCmd == "help" then
+            speakInGame("Cmds: interact, ownerfirefalse, ownerfiretrue, randomattack, randomattackstop, alwaysequip, unalwaysequip, attack, stopattack, datareset, equip, blacklist, autojump, fightorflight, follow, freeze, wander, pathfind")
+            return
+        end
+    end
+
+    if isAdmin then
+        if cleanMsgLower == "!pip globalchatenable" then GlobalChatActive = true; speakInGame("Global scan active.") return
+        elseif cleanMsgLower == "!pip globalchatdisable" then GlobalChatActive = false; speakInGame("Global scan disabled.") return end
+    end
+
+    if not AiGenerationEnabled or (not isAdmin and not GlobalChatActive) or sender == LocalPlayer then return end
+
+    local dataPayload = { userId = sender.UserId, username = sender.Name, message = cleanMsg }
+    task.spawn(function()
+        local responseBody = nil
+        pcall(function()
+            if httpRequest == HttpService.PostAsync then
+                responseBody = HttpService:PostAsync(RENDER_URL, HttpService:JSONEncode(dataPayload), Enum.HttpContentType.ApplicationJson)
+            else
+                local success, res = pcall(function()
+                    return httpRequest({
+                        Url = RENDER_URL,
+                        Method = "POST",
+                        Headers = { ["Content-Type"] = "application/json" },
+                        Timeout = 25,
+                        Body = HttpService:JSONEncode(dataPayload)
+                    })
+                end)
+                if success and res and res.Body then responseBody = res.Body end
+            end
+        end)
+        
+        if responseBody then
+            local successDecode, responseData = pcall(function() return HttpService:JSONDecode(responseBody) end)
+            if successDecode and responseData then speakInGame(responseData.response) end
+        end
+    end)
+end
+
+-- =====================================================================
+-- LIFECYCLE ATTACHMENTS
+-- =====================================================================
+if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+    TextChatService.MessageReceived:Connect(function(textMessage)
+        if textMessage.TextSource then
+            local sender = Players:GetPlayerByUserId(textMessage.TextSource.UserId)
+            if sender then processIncomingPayload(sender, textMessage.Text) end
+        end
+    end)
+else
+    Players.PlayerAdded:Connect(function(p) p.Chatted:Connect(function(msg) processIncomingPayload(p, msg) end) end)
+    for _, p in ipairs(Players:GetPlayers()) do p.Chatted:Connect(function(msg) processIncomingPayload(p, msg) end) end
+end
+
+LocalPlayer.CharacterAdded:Connect(function(newChar)
+    Character = newChar
+    Humanoid  = newChar:WaitForChild("Humanoid")
+    RootPart  = newChar:WaitForChild("HumanoidRootPart")
+    stopAllMovement()
+    FlightPanicUntil = 0
+    IsCurrentlyWalking = false
+    RandomAttackActive = false 
+    RandomCurrentTarget = nil
+    if FightOrFlightActive or DirectAttackTarget then setupThreatTracking() runCombatCoreBrain() end
+end)
+
+task.wait(1.2)
+speakInGame("Hey! I'm Charlie, your Ai personal helper friend. Ask me anything; I know everything.")
